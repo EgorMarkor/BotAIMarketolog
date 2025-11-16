@@ -203,38 +203,8 @@ def split_for_telegram(text: str, chunk_size: int = 3500) -> List[str]:
     return [p for p in parts if p]
 
 
-async def _typing_pulse(bot, chat_id: int):
-    try:
-        while True:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            await asyncio.sleep(4)
-    except asyncio.CancelledError:
-        pass
-
-
-async def run_with_typing_indicator(bot, chat_id: Optional[int], awaitable: Awaitable[Any]):
-    if bot is None or chat_id is None:
-        return await awaitable
-
-    typing_task = asyncio.create_task(_typing_pulse(bot, chat_id))
-    try:
-        return await awaitable
-    finally:
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await typing_task
-
-
-async def ask_gpt_with_typing(bot, chat_id: Optional[int], prompt: str, *, system: str = None, temperature: float = TEMPERATURE) -> str:
-    return await run_with_typing_indicator(
-        bot,
-        chat_id,
-        chatgpt_answer(prompt, system=system, temperature=temperature)
-    )
-
-
 def format_gpt_answer_for_telegram(text: str) -> str:
-    """Преобразует ответ в аккуратные блоки с заголовками и маркерами."""
+    """Делает структурированную выдачу для Telegram без Markdown/HTML."""
     if not text:
         return ""
 
@@ -242,74 +212,46 @@ def format_gpt_answer_for_telegram(text: str) -> str:
     if not normalized:
         return ""
 
-    def prettify_heading(raw: str) -> str:
-        cleaned = re.sub(r"^#{1,6}\s*", "", raw).strip()
-        cleaned = re.sub(r"^[\-•—\*]+\s*", "", cleaned)
-        cleaned = re.sub(r"^\d+[)\.\-–]\s*", "", cleaned)
-        cleaned = cleaned.strip().strip("*")
-        cleaned = cleaned.rstrip(":：")
-        if ":" in cleaned:
-            left, right = cleaned.split(":", 1)
-            if right.strip():
-                cleaned = f"{left.strip()} — {right.strip()}"
-            else:
-                cleaned = left.strip()
-        return cleaned
+    blocks = [b.strip() for b in re.split(r"\n{2,}", normalized) if b.strip()]
+    formatted_blocks: List[str] = []
 
-    def format_bullet(body: str, indent: int) -> str:
-        body = body.strip()
-        body = body.strip("*-—• ")
-        body = re.sub(r"^\d+[)\.\-–]\s*", "", body).strip()
-        if not body:
-            return ""
-        indent_level = min(max(indent // 2, 0), 3)
-        prefix = "  " * indent_level
-        return f"{prefix}• {body}"
-
-    formatted_lines: List[str] = []
-    blank_pending = False
-    last_type = ""
-
-    for raw_line in normalized.split("\n"):
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            blank_pending = True
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
             continue
 
-        indent = len(line) - len(line.lstrip(" "))
-        line_type = "text"
-        formatted = ""
+        original_header = lines[0]
+        header_line = re.sub(r"^[\-•—\*]+\s*", "", original_header).strip()
+        header_line = re.sub(r"^\d+[)\.\-–]\s*", "", header_line).strip()
+        if not header_line:
+            header_line = original_header.strip()
 
-        if stripped.startswith("#"):
-            line_type = "header"
-            formatted = f"🔷 {prettify_heading(stripped)}"
-        elif (stripped.startswith("**") and stripped.endswith("**")) or (stripped.endswith(":") and len(stripped.split()) <= 6):
-            line_type = "subheader"
-            formatted = f"▫️ {prettify_heading(stripped)}"
+        inline_body = ""
+        if ":" in header_line:
+            potential_header, potential_body = header_line.split(":", 1)
+            if potential_body.strip():
+                inline_body = potential_body.strip()
+            header_line = potential_header.strip()
+
+        body_candidates = []
+        if inline_body:
+            body_candidates.append(inline_body)
+        body_candidates.extend(lines[1:])
+
+        formatted_body = []
+        for raw_line in body_candidates:
+            clean = re.sub(r"^[\-•—\*]+\s*", "", raw_line).strip()
+            clean = re.sub(r"^\d+[)\.\-–]\s*", "", clean).strip()
+            if clean:
+                formatted_body.append(f"• {clean}")
+
+        header_text = f"🔹 {header_line}" if header_line else ""
+        if formatted_body:
+            formatted_blocks.append(header_text + "\n" + "\n".join(formatted_body))
         else:
-            bullet_match = re.match(r"^([\-•\*]+|[–—]|\d+[\.\)])\s+(.*)$", stripped)
-            if bullet_match:
-                line_type = "bullet"
-                formatted = format_bullet(bullet_match.group(2), indent)
-            else:
-                formatted = stripped
+            formatted_blocks.append(header_text)
 
-        if formatted:
-            if formatted_lines:
-                if blank_pending and formatted_lines[-1] != "":
-                    formatted_lines.append("")
-                elif line_type in ("header", "subheader") and formatted_lines[-1] != "":
-                    formatted_lines.append("")
-                elif line_type == "bullet" and last_type not in ("bullet", "subheader") and formatted_lines[-1] != "":
-                    formatted_lines.append("")
-
-            formatted_lines.append(formatted)
-            last_type = line_type
-            blank_pending = False
-
-    pretty = "\n".join(line for line in formatted_lines if line is not None).strip()
-    return pretty or normalized
+    return "\n\n".join(formatted_blocks) if formatted_blocks else normalized
 
 
 async def send_split_text(message_obj, text: str, *, parse_mode=None, disable_preview: bool = True, reply_markup=None):
