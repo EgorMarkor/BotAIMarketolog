@@ -201,6 +201,57 @@ def split_for_telegram(text: str, chunk_size: int = 3500) -> List[str]:
     return [p for p in parts if p]
 
 
+def format_gpt_answer_for_telegram(text: str) -> str:
+    """Делает структурированную выдачу для Telegram без Markdown/HTML."""
+    if not text:
+        return ""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    blocks = [b.strip() for b in re.split(r"\n{2,}", normalized) if b.strip()]
+    formatted_blocks: List[str] = []
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+
+        original_header = lines[0]
+        header_line = re.sub(r"^[\-•—\*]+\s*", "", original_header).strip()
+        header_line = re.sub(r"^\d+[)\.\-–]\s*", "", header_line).strip()
+        if not header_line:
+            header_line = original_header.strip()
+
+        inline_body = ""
+        if ":" in header_line:
+            potential_header, potential_body = header_line.split(":", 1)
+            if potential_body.strip():
+                inline_body = potential_body.strip()
+            header_line = potential_header.strip()
+
+        body_candidates = []
+        if inline_body:
+            body_candidates.append(inline_body)
+        body_candidates.extend(lines[1:])
+
+        formatted_body = []
+        for raw_line in body_candidates:
+            clean = re.sub(r"^[\-•—\*]+\s*", "", raw_line).strip()
+            clean = re.sub(r"^\d+[)\.\-–]\s*", "", clean).strip()
+            if clean:
+                formatted_body.append(f"• {clean}")
+
+        header_text = f"🔹 {header_line}" if header_line else ""
+        if formatted_body:
+            formatted_blocks.append(header_text + "\n" + "\n".join(formatted_body))
+        else:
+            formatted_blocks.append(header_text)
+
+    return "\n\n".join(formatted_blocks) if formatted_blocks else normalized
+
+
 async def send_split_text(message_obj, text: str, *, parse_mode=None, disable_preview: bool = True, reply_markup=None):
     chunks = split_for_telegram(text)
     for idx, chunk in enumerate(chunks):
@@ -258,7 +309,8 @@ async def send_boltalka_hint(message_obj):
 
 
 async def send_gpt_reply(message_obj, st: UserState, answer: str, *, last_user_text: Optional[str] = None, parse_mode=None):
-    await send_split_text(message_obj, answer, parse_mode=parse_mode)
+    formatted_answer = format_gpt_answer_for_telegram(answer)
+    await send_split_text(message_obj, formatted_answer, parse_mode=parse_mode)
     reset_boltalka_context(st, last_user_text, answer)
     await send_boltalka_hint(message_obj)
 
@@ -735,7 +787,8 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # сохраняем ответ
     st.chat_history.append({"role": "assistant", "content": answer})
 
-    await send_split_text(update.message, answer)
+    formatted_answer = format_gpt_answer_for_telegram(answer)
+    await send_split_text(update.message, formatted_answer)
     await send_boltalka_hint(update.message)
 
 
