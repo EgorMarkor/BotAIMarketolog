@@ -1,0 +1,1060 @@
+# main.py
+# AI-МАРКЕТОЛОГ 360° — Telegram-бот в одном файле, продакшн-ready
+# Зависимости:
+#   pip install python-telegram-bot==20.8 openai python-dotenv pandas openpyxl reportlab
+
+import os
+import io
+import re
+import time
+import json
+import math
+import traceback
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional
+
+from dotenv import load_dotenv
+import pandas as pd
+
+from telegram import (
+    Update,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InputFile
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes,
+    CommandHandler, MessageHandler, CallbackQueryHandler, filters
+)
+
+# ---- OpenAI SDK
+from openai import OpenAI
+
+import datetime
+
+LOG_FILE = "logs.jsonl"
+
+def log_event(user_id: int, user_message: str, bot_answer: str, stage: str = ""):
+    """Записывает событие в JSONL файл."""
+    try:
+        record = {
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "user_id": user_id,
+            "stage": stage,
+            "user_message": user_message,
+            "bot_answer": bot_answer,
+        }
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print("LOGGING ERROR:", e)
+
+# ------------------------------
+# 🔧 ИНИЦИАЛИЗАЦИЯ
+# ------------------------------
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+    raise RuntimeError("Не заданы TELEGRAM_TOKEN / OPENAI_API_KEY в .env")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ------------------------------
+# 🧩 КОНСТАНТЫ И ВСПОМОГАТЕЛЬНОЕ
+# ------------------------------
+
+BOT_NAME = "AI-маркетолог 360°"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
+TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
+OPENAI_RETRIES = 3
+
+MAIN_MENU = ReplyKeyboardMarkup([
+    ["🧭 Диагностика бизнеса"],
+    ["🧬AI-Маркетолог", "☄️Генерация контента"],
+    ["📞 Связаться с командой"]
+], resize_keyboard=True)
+
+# Кнопки быстрых внутренних веток (вставляем по контексту)
+def aux_menu():
+    return ReplyKeyboardMarkup([
+        ["💡 Как я могу помочь твоему бизнесу"],
+        ["📊 Показать стратегию роста", "🧠 AI-инструменты для компании"],
+        ["🧾 Мои цифры и анализ"],
+        ["⬅️ В главное меню"]
+    ], resize_keyboard=True)
+
+def back_main_buttons():
+    return ReplyKeyboardMarkup([["⬅️ В главное меню"]], resize_keyboard=True)
+
+def yes_later_buttons():
+    return ReplyKeyboardMarkup([["Да, поехали 🚀"], ["Позже"]], resize_keyboard=True)
+
+def report_menu():
+    return ReplyKeyboardMarkup([
+        ["Продукт 📦", "Целевая аудитория 🎯"],
+        ["Продажи 💰", "Маркетинг 📣"],
+        ["Команда 👥", "Конкуренты ⚔️"],
+        ["Цифры и аналитика 📊", "Приоритеты ⚡️"],
+        ["Сохранить отчёт PDF 📁", "⬅️ В главное меню"]
+    ], resize_keyboard=True)
+
+# Подменю: AI-Маркетолог
+AI_MARKETER_MENU = ReplyKeyboardMarkup([
+    ["📊 Провести анализ компании", "💡 Составить стратегию"],
+    ["🧩 Создать контент-план", "📈 Подобрать каналы трафика"],
+    ["⚙️ Внедрить AI для автоматизации"],
+    ["⬅️ В главное меню"]
+], resize_keyboard=True)
+
+# Подменю: Генерация контента
+CONTENT_MENU = ReplyKeyboardMarkup([
+    ["Идеи Reels 🎬", "Заголовки 🔥"],
+    ["Посты/описания ✍️", "Контент-план на 14 дней 🗓️"],
+    ["Тексты для баннеров 📣"],
+    ["⬅️ В главное меню"]
+], resize_keyboard=True)
+
+INLINE_CONTACT = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Написать в Telegram менеджеру", url="https://t.me/maglena_a")],
+    [InlineKeyboardButton("Получить презентацию 360°", callback_data="get_presentation")]
+])
+
+INLINE_START_DIAG = InlineKeyboardMarkup([
+    [InlineKeyboardButton("НАЧАТЬ ДИАГНОСТИКУ 🚀", callback_data="start_diag")]
+])
+
+INLINE_COMP_MENU = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("Цены и позиционирование 💰", callback_data="comp_prices"),
+        InlineKeyboardButton("Контент и продвижение 📣", callback_data="comp_content")
+    ],
+    [
+        InlineKeyboardButton("Продукт и предложения ⚙️", callback_data="comp_product"),
+        InlineKeyboardButton("Всё вместе 🧠", callback_data="comp_all")
+    ],
+    [InlineKeyboardButton("⏪ Назад", callback_data="comp_back")]
+])
+
+INLINE_GROWTH_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Получить отчёт 📊", callback_data="get_report")],
+    [InlineKeyboardButton("Да, шаг за шагом 🚀", callback_data="plan_30d")],
+    [InlineKeyboardButton("Получить аудит конкурентов 🕵️", callback_data="comp_all")]
+])
+
+# ------------------------------
+# 🧠 ВЫЗОВ ChatGPT С РЕТРАЯМИ
+# ------------------------------
+async def chatgpt_answer(prompt: str, system: str = None, temperature: float = TEMPERATURE) -> str:
+    sys_msg = system or "Ты — AI-маркетолог 360° в России в 2025 году, эксперт по стратегиям роста бизнеса, аналитике и автоматизации. Отвечай чётко, по делу. Анализируй существующую информацию на данный момент по законам РФ и стратегиям, используемых в РФ и отвечай с их пониманием. Укладывай свой ответ в 4096 символов (русских символов, кириллица)"
+    last_err = None
+    for attempt in range(OPENAI_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=temperature,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            # логирование
+            log_event(
+                user_id=0,  # потом заменим на реальный ID в текстовом роутере
+                user_message=prompt,
+                bot_answer=answer,
+                stage="chatgpt_core"
+            )
+            return answer
+
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8 * (attempt + 1))
+    raise last_err
+
+def sanitize(text: str, max_len: int = 3500) -> str:
+    if not text:
+        return ""
+    text = text.replace("\x00", " ").strip()
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+# ------------------------------
+# 🗂️ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ
+# ------------------------------
+@dataclass
+class UserState:
+    stage: str = "idle"
+    diagnostic_step: int = 0
+    answers: Dict[str, Any] = field(default_factory=dict)
+    competitors: List[str] = field(default_factory=list)
+    sales_df_summary: Optional[str] = None
+    last_report_text: Optional[str] = None
+    last_report_sections: Dict[str, str] = field(default_factory=dict)
+    chat_mode: bool = False
+    chat_history: List[Dict[str, str]] = field(default_factory=list)
+
+STATE: Dict[int, UserState] = {}  # map user_id -> UserState
+
+def get_state(user_id: int) -> UserState:
+    if user_id not in STATE:
+        STATE[user_id] = UserState()
+    return STATE[user_id]
+
+def reset_state(user_id: int):
+    STATE[user_id] = UserState()
+
+# ------------------------------
+# 📋 ВОПРОСЫ ДИАГНОСТИКИ (СОКР. + РАСШ.)
+# ------------------------------
+DIAG_QUESTIONS = [
+    # ШАГ 1 — О компании
+    ("company_name", "1️⃣ Как называется твоя компания или бренд?"),
+    ("about", "2️⃣ Чем вы занимаетесь (2–3 предложения)?"),
+    ("age", "3️⃣ Сколько лет бизнесу?"),
+    ("main_result", "4️⃣ Какой главный результат хочешь через 6–12 месяцев?"),
+
+    # ШАГ 2 — Продукт
+    ("main_product", "5️⃣ Какой продукт или услуга основные?"),
+    ("advantages", "6️⃣ Главные преимущества по сравнению с конкурентами?"),
+    ("upsells", "7️⃣ Есть доп. продукты, подписки или апсейлы?"),
+    ("retention", "8️⃣ Как часто клиенты возвращаются/повторно покупают?"),
+    ("feedback", "9️⃣ Что чаще всего говорят клиенты о продукте?"),
+
+    # ШАГ 3 — Клиенты
+    ("ideal_client", "🔟 Кто ваш идеальный клиент?"),
+    ("found_where", "1️⃣1️⃣ Где клиенты чаще всего вас находят?"),
+    ("why_you", "1️⃣2️⃣ Почему выбирают именно вас?"),
+    ("segment_focus", "1️⃣3️⃣ Какой сегмент клиентов приоритетнее?"),
+    ("objections", "1️⃣4️⃣ Какие возражения чаще всего слышите?"),
+
+    # ШАГ 4 — Продажи и воронка
+    ("journey", "1️⃣5️⃣ Опиши путь клиента от первого касания до покупки."),
+    ("loss_points", "1️⃣6️⃣ Где чаще всего теряются клиенты?"),
+    ("repeat_sales", "1️⃣7️⃣ Есть ли повторные продажи/программы лояльности?"),
+    ("conv_rate", "1️⃣8️⃣ Средняя конверсия из заявки в оплату (если знаешь)?"),
+    ("avg_check", "1️⃣9️⃣ Какой средний чек?"),
+    ("sales_tools", "2️⃣0️⃣ Какие инструменты продаж используете? (CRM, сайт, мессенджеры, маркетплейсы и т.д.)"),
+    ("who_handles", "2️⃣1️⃣ Кто обрабатывает заявки — менеджеры, вы сами или бот?"),
+    ("scripts", "2️⃣2️⃣ Есть ли скрипты/шаблоны/стандарты продаж?"),
+    ("sales_review_freq", "2️⃣3️⃣ Как часто анализируете эффективность продаж/каналов?"),
+
+    # ШАГ 5 — Маркетинг
+    ("main_channels", "2️⃣4️⃣ Какие каналы приносят основной поток клиентов?"),
+    ("tested_last_year", "2️⃣5️⃣ Что пробовали в последний год — что сработало лучше всего?"),
+    ("failed_channels", "2️⃣6️⃣ Какие каналы не дали результата при высоких ожиданиях?"),
+    ("paid_vs_org", "2️⃣7️⃣ % клиентов с рекламы vs органика?"),
+    ("eval_method", "2️⃣8️⃣ Как оцениваете эффективность (ROI, ROMI, CPL, LTV, интуиция)?"),
+    ("regular_analytics", "2️⃣9️⃣ Есть ли регулярная аналитика по трафику и продажам?"),
+    ("who_marketing", "3️⃣0️⃣ Кто отвечает за маркетинг?"),
+    ("have_strategy", "3️⃣1️⃣ Есть ли стратегия продвижения на 3–6 месяцев?"),
+    ("hypo_tests", "3️⃣2️⃣ Как часто запускаете новые гипотезы?"),
+    ("collabs", "3️⃣3️⃣ Используете коллаборации/блогеров/партнёрки?"),
+    ("content_plan", "3️⃣4️⃣ Есть ли контент-план или постите ситуативно?"),
+    ("best_formats", "3️⃣5️⃣ Какие форматы дают лучший отклик (видео, кейсы, отзывы и т.д.)?"),
+    ("positioning", "3️⃣6️⃣ Есть ли чёткое позиционирование и узнаваемый визуал?"),
+    ("ad_budget", "3️⃣7️⃣ Какой рекламный бюджет в месяц (диапазон)?"),
+    ("seasonality", "3️⃣8️⃣ Есть ли сезонность спроса?"),
+
+    # ШАГ 6 — Команда и процессы
+    ("who_decides", "3️⃣9️⃣ Кто принимает решения по маркетингу/развитию?"),
+    ("roles", "4️⃣0️⃣ Какие роли внутри (маркетолог, дизайнер, таргетолог, продажи)?"),
+    ("stable_vs_manual", "4️⃣1️⃣ Что работает стабильно, а где «ручное управление»?"),
+    ("delegate_first", "4️⃣2️⃣ Что хочется делегировать в первую очередь?"),
+    ("meetings", "4️⃣3️⃣ Есть ли регулярные совещания по результатам маркетинга?"),
+    ("to_automate", "4️⃣4️⃣ Какие процессы автоматизировать в ближайшие 3 месяца?"),
+]
+
+# ------------------------------
+# 🖨️ PDF-ОТЧЁТ (ReportLab)
+# ------------------------------
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+
+def make_pdf_report(username: str, summary_text: str, sections: Dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    left = 18 * mm
+    top = height - 20 * mm
+
+    def write_wrapped(text: str, x: float, y: float, max_width: float, leading=14):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        lines = []
+        for paragraph in text.split("\n"):
+            words = paragraph.split(" ")
+            line = ""
+            for w in words:
+                test = (line + " " + w).strip()
+                if stringWidth(test, "Helvetica", 11) <= max_width:
+                    line = test
+                else:
+                    lines.append(line)
+                    line = w
+            lines.append(line)
+            lines.append("")  # blank between paragraphs
+        cur_y = y
+        for ln in lines:
+            if cur_y < 20 * mm:
+                c.showPage()
+                cur_y = height - 20 * mm
+                c.setFont("Helvetica", 11)
+            c.drawString(x, cur_y, ln)
+            cur_y -= leading
+        return cur_y
+
+    c.setTitle(f"Отчёт {BOT_NAME}")
+    c.setAuthor(BOT_NAME)
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(left, top, f"Итоговый отчёт — {BOT_NAME}")
+    c.setFont("Helvetica", 11)
+    c.drawString(left, top - 14, f"Пользователь: {username}")
+
+    y = top - 30
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(left, y, "Краткое резюме")
+    y -= 18
+    c.setFont("Helvetica", 11)
+    y = write_wrapped(sanitize(summary_text, 8000), left, y, width - 2*left)
+
+    for title, body in sections.items():
+        if y < 40 * mm:
+            c.showPage()
+            y = height - 20 * mm
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(left, y, title)
+        y -= 18
+        c.setFont("Helvetica", 11)
+        y = write_wrapped(sanitize(body, 8000), left, y, width - 2*left)
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+# ------------------------------
+# 🏁 СТАРТ / HELP / CANCEL
+# ------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    reset_state(user.id)
+    text = (
+        f"👋 Привет! Я — {BOT_NAME}\n"
+        "Твой личный интеллект для роста бизнеса.\n"
+        "Я анализирую, считаю, создаю и стратегирую.\n"
+        "Помогаю расти быстрее, дешевле и умнее — на основе данных и AI.\n\n"
+        "Как это работает👇\n"
+        "• Анализирую бизнес за 5 минут\n"
+        "• Нахожу точки роста и утечки прибыли\n"
+        "• Даю дорожную карту на 30–90 дней\n"
+        "• Сравниваю с рынком и конкурентами\n"
+        "• Генерирую контент и считаю эффективность\n"
+        "• Внедряю AI-инструменты и сопровождаю ежедневно\n\n"
+        "Предлагаю провести диагностику, чтобы показать стратегию 360°."
+    )
+    await update.message.reply_text(text, reply_markup=MAIN_MENU)
+    await update.message.reply_text("Готов начать диагностику?", reply_markup=INLINE_START_DIAG)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/start — начало\n"
+        "/help — помощь\n"
+        "/cancel — сброс диалога",
+        reply_markup=MAIN_MENU
+    )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    reset_state(user.id)
+    await update.message.reply_text("Окей, всё сбросил. Что дальше?", reply_markup=MAIN_MENU)
+
+# ------------------------------
+# 🧭 ОБРАБОТКА ГЛАВНОГО МЕНЮ (ТЕКСТ)
+# ------------------------------
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    st = get_state(user.id)
+    txt = (update.message.text or "").strip()
+    
+    user_id = user.id
+    log_event(
+        user_id=user_id,
+        user_message=txt,
+        bot_answer="", 
+        stage=st.stage
+    )
+
+
+    if txt in ("⬅️ В главное меню", "В главное меню", "/menu"):
+        reset_state(user.id)
+        await update.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+        st.chat_mode = False
+        st.chat_history = []
+        return
+
+    # 1️⃣ Протестировать AI-маркетолога
+    if "Протестировать AI-маркетолога" in txt:
+        msg = (
+            "Демо-режим 🧠\n"
+            "Покажу, как нахожу точки роста и формирую гипотезы.\n\n"
+            "Готов пройти мини-тест (3 вопроса) и получить идеи?"
+        )
+        st.stage = "demo"
+        await update.message.reply_text(msg, reply_markup=yes_later_buttons())
+        return
+
+    # 2️⃣ Диагностика бизнеса
+    if "Диагностика бизнеса" in txt or txt == "Пройти диагностику 🚀" or txt == "Начать диагностику 🚀":
+        st.stage = "diag"
+        st.diagnostic_step = 0
+        await update.message.reply_text(
+            "📊 Диагностика — стратегический брифинг.\nПосле ответов покажу картину состояния, точки роста и приоритеты.\n\nГотов начать?",
+            reply_markup=yes_later_buttons()
+        )
+        return
+
+    # 3️⃣ Что я умею
+    if "Что я умею" in txt:
+        msg = (
+            "Я — не просто бот. Я маркетолог, который видит бизнес на 360°:\n\n"
+            "📊 Анализ бизнеса\n🎯 Стратегия продвижения\n📣 Контент\n🚀 Трафик и воронки\n🤖 Внедрение AI\n📈 Прогноз роста\n\n"
+            "Выбери, что показать:"
+        )
+        await update.message.reply_text(msg, reply_markup=aux_menu())
+        return
+
+    # 4️⃣ Примеры и кейсы
+    if "Примеры и кейсы" in txt:
+        msg = (
+            "Реальные результаты:\n\n"
+            "👕 Бренд одежды — +220% за 3 месяца\n"
+            "💪 Спорпит — рост на 180%\n"
+            "🎓 Онлайн-курс — −40% CPL\n\n"
+            "Хочешь так же? Пройди диагностику."
+        )
+        await update.message.reply_text(msg, reply_markup=ReplyKeyboardMarkup([["Пройти диагностику 🚀"], ["⬅️ В главное меню"]], resize_keyboard=True))
+        return
+
+    # 5️⃣ Связаться с командой
+    if "Связаться с командой" in txt or "Связаться с командой 360°" in txt:
+        msg = (
+            "Хочешь индивидуальную стратегию или AI-внедрение под ключ?\n"
+            "Выбери действие:"
+        )
+        await update.message.reply_text(msg, reply_markup=back_main_buttons())
+        await update.message.reply_text("Контакты:", reply_markup=back_main_buttons())
+        await update.message.reply_text("Нажми кнопку ниже, чтобы написать менеджеру:", reply_markup=INLINE_CONTACT)
+        return
+
+    # Подменю: AI-Маркетолог
+    if txt == "AI-Маркетолог" or txt == "🧬AI-Маркетолог":
+        await update.message.reply_text("Выбери действие:", reply_markup=AI_MARKETER_MENU)
+        return
+
+    if txt == "📊 Провести анализ компании":
+        st.stage = "quick_analyze"
+        await update.message.reply_text("Напиши в одной фразе: что продаёте, кому и через какие каналы сейчас?", reply_markup=back_main_buttons())
+        return
+
+    if st.stage == "quick_analyze" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Сделай экспресс-анализ компании и 5 точек роста."
+            " Формат: 1) Краткое резюме 2) Точки роста 3) Быстрые действия на 7 дней 4) Метрики.\n"
+            f"Ввод: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "💡 Составить стратегию":
+        st.stage = "quick_strategy"
+        await update.message.reply_text("Опиши цель на 30–90 дней и бюджет (диапазон).", reply_markup=back_main_buttons())
+        return
+
+    if st.stage == "quick_strategy" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Составь конспект стратегии на 90 дней: цели, каналы, гипотезы, вехи по неделям, риски, метрики."
+            f" Дано: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "🧩 Создать контент-план":
+        st.stage = "quick_cplan"
+        await update.message.reply_text("Ниша и ключевой продукт? Укажи площадку (TG/IG/ВК/YouTube).", reply_markup=back_main_buttons())
+        return
+
+    if st.stage == "quick_cplan" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Составь контент-план на 2 недели: 14 постов/роликов с идеей, тезисами, CTA и метрикой."
+            f" Дано: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "📈 Подобрать каналы трафика":
+        st.stage = "quick_channels"
+        await update.message.reply_text("Кто ЦА и какой средний чек?", reply_markup=back_main_buttons())
+        return
+
+    if st.stage == "quick_channels" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Подбери 5 каналов трафика с обоснованием, старт-бюджетом, первыми шагами и основными рисками."
+            f" Дано: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "⚙️ Внедрить AI для автоматизации":
+        prompt = (
+            "Дай дорожную карту внедрения AI в SMB: контент, продажи, поддержка, аналитика, алерты, интеграции."
+            " Формат: этапы (2 недели, 30 дней, 60 дней), инструменты, метрики, риски."
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        return
+
+    # Подменю: Генерация контента
+    if txt == "Генерация контента" or txt == "☄️Генерация контента":
+        await update.message.reply_text("Что сгенерировать?", reply_markup=CONTENT_MENU)
+        return
+
+    if txt == "Идеи Reels 🎬":
+        st.stage = "reels"
+        await update.message.reply_text("Опиши продукт/услугу и площадку. Дам 10 идей с хук-строками.", reply_markup=back_main_buttons())
+        return
+    if st.stage == "reels" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Сгенерируй 10 идей Reels/Shorts: хук, сюжет в 3 шага, финальный CTA, хронометраж до 30 сек."
+            f" Ввод: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "Заголовки 🔥":
+        st.stage = "titles"
+        await update.message.reply_text("Какая тема? Дам 20 заголовков в 4 стилях.", reply_markup=back_main_buttons())
+        return
+    if st.stage == "titles" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Сгенерируй 20 заголовков: 5 инфо, 5 выгода, 5 триггер, 5 проблематика."
+            f" Тема: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "Посты/описания ✍️":
+        st.stage = "posts"
+        await update.message.reply_text("Тема/оффер и площадка (TG/IG/ВК/маркетплейс)?", reply_markup=back_main_buttons())
+        return
+    if st.stage == "posts" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Напиши 3 варианта поста/описания: краткий, подробный, продающий. Добавь CTA и эмодзи."
+            f" Тема: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "Контент-план на 14 дней 🗓️":
+        st.stage = "cplan14"
+        await update.message.reply_text("Ниша, задача (продажи/охваты/экспертность) и платформа?", reply_markup=back_main_buttons())
+        return
+    if st.stage == "cplan14" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Сформируй таблицей план на 14 дней: формат, идея, тезисы, CTA, цель метрики."
+            f" Ввод: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        st.stage = "idle"
+        return
+
+    if txt == "Тексты для баннеров 📣":
+        st.stage = "banners"
+        await update.message.reply_text("Продукт + спецпредложение + ЦА. Дам 8 вариантов УТП в 4 форматах.", reply_markup=back_main_buttons())
+        return
+    if st.stage == "banners" and txt not in ("⬅️ В главное меню",):
+        prompt = (
+            "Сгенерируй 8 баннерных текстов: короткие (до 6 слов), оффер+боль, срочность, соц.доказательства."
+            f" Дано: {txt}"
+        )
+        ans = await chatgpt_answer(prompt)
+        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        st.stage = "idle"
+        return
+
+    # Доп. ветки
+    if "Как я могу помочь твоему бизнесу" in txt:
+        await update.message.reply_text(
+            "Я анализирую текущие показатели, выявляю точки потерь и даю пошаговый план: стратегия, контент, трафик, автоматизация. Обычно видимые улучшения — в первые 30 дней.",
+            reply_markup=aux_menu()
+        )
+        return
+
+    if "Показать стратегию роста" in txt:
+        await update.message.reply_text(
+            "Чтобы показать реальную стратегию, пройдём диагностику — это займёт 3–5 минут.",
+            reply_markup=ReplyKeyboardMarkup([["Начать диагностику 🚀"], ["⬅️ В главное меню"]], resize_keyboard=True)
+        )
+        return
+
+    if "AI-инструменты для компании" in txt:
+        ideas = (
+            "🧠 Где внедрить AI:\n"
+            "• Автогенерация контента (посты, Reels, баннеры)\n"
+            "• Сценарии лид-менеджмента и триггеры\n"
+            "• Скрипты продаж и Q&A по базе знаний\n"
+            "• Прогноз спроса/бюджетов, алерты по метрикам\n"
+            "• Аналитика воронки и когорт"
+        )
+        await update.message.reply_text(ideas, reply_markup=aux_menu())
+        return
+
+    if "Мои цифры и анализ" in txt:
+        st.stage = "await_sales_file"
+        await update.message.reply_text(
+            "Отправь файл с продажами (CSV или XLSX). Я выделю закономерности и слабые места.",
+            reply_markup=ReplyKeyboardMarkup([["Пропустить"], ["⬅️ В главное меню"]], resize_keyboard=True)
+        )
+        return
+
+    # Кнопки отчёта
+    if txt in ("Продукт 📦", "Целевая аудитория 🎯", "Продажи 💰", "Маркетинг 📣", "Команда 👥", "Конкуренты ⚔️", "Цифры и аналитика 📊", "Приоритеты ⚡️"):
+        await show_report_section(update, context, txt)
+        return
+
+    if txt == "Сохранить отчёт PDF 📁":
+        await export_pdf(update, context)
+        return
+
+    # «Да/Позже» в разных ветках
+    if st.stage == "demo":
+        await handle_demo_flow(update, context, txt)
+        return
+
+    if st.stage in ("diag", "diag_running"):
+        await handle_diagnostic_flow(update, context, txt)
+        return
+    
+    # === Болталка после диагностики ===
+    if st.chat_mode:
+        return await handle_chat_mode(update, context)
+
+
+    # Приклеиваем «умный ответ» если ничего не подошло
+    await update.message.reply_text(
+            "Я тебя услышал. Чтобы получить максимальную пользу — выбери действие в меню ниже:",
+            reply_markup=MAIN_MENU
+    )
+    
+    
+async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    st = get_state(user.id)
+    txt = update.message.text.strip()
+
+    # добавляем сообщение в историю
+    st.chat_history.append({"role": "user", "content": txt})
+
+    # ограничиваем историю
+    MAX_HISTORY = 12
+    if len(st.chat_history) > MAX_HISTORY:
+        st.chat_history = st.chat_history[-MAX_HISTORY:]
+
+    # формируем сообщения
+    messages = [
+        {"role": "system", "content": "Ты — AI-маркетолог 360°. Отвечай коротко, по делу, учитывай контекст диагностики."},
+
+        # контекст диагностики
+        {"role": "system", "content": f"Контекст диагностики: {json.dumps(st.answers, ensure_ascii=False)}"},
+    ]
+
+    # сама история
+    messages.extend(st.chat_history)
+
+    # вызываем OpenAI
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=TEMPERATURE,
+        max_tokens=1500,
+    )
+    answer = resp.choices[0].message.content.strip()
+
+    # сохраняем ответ
+    st.chat_history.append({"role": "assistant", "content": answer})
+
+    await update.message.reply_text(answer)
+
+
+# ------------------------------
+# 📎 ДОКУМЕНТЫ (CSV/XLSX)
+# ------------------------------
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    st = get_state(user.id)
+    doc = update.message.document
+    if not doc:
+        return
+    fname = (doc.file_name or "").lower()
+    if st.stage != "await_sales_file":
+        await update.message.reply_text("Файл принят, но сейчас он не нужен. Нажми «Мои цифры и анализ», чтобы загрузить отчёт по продажам.", reply_markup=aux_menu())
+        return
+    if not (fname.endswith(".csv") or fname.endswith(".xlsx") or fname.endswith(".xls")):
+        await update.message.reply_text("Поддерживаю CSV и XLSX. Отправь, пожалуйста, один из этих форматов.")
+        return
+
+    try:
+        file = await doc.get_file()
+        bio = io.BytesIO()
+        await file.download_to_memory(bio)
+        bio.seek(0)
+        if fname.endswith(".csv"):
+            df = pd.read_csv(bio)
+        else:
+            df = pd.read_excel(bio)
+        summary = summarize_sales_df(df)
+        st.sales_df_summary = summary
+        await update.message.reply_text("Принял файл ✅\nПредварительный разбор:", reply_markup=aux_menu())
+        await update.message.reply_text(f"```\n{summary}\n```", parse_mode=ParseMode.MARKDOWN)
+        st.stage = "idle"
+    except Exception as e:
+        await update.message.reply_text("Не удалось обработать файл. Проверь формат/кодировку и попробуй снова.")
+        print("File parse error:", e)
+
+def summarize_sales_df(df: pd.DataFrame) -> str:
+    info = []
+    try:
+        info.append(f"Строк: {len(df):,}".replace(",", " "))
+        info.append(f"Колонок: {len(df.columns)}")
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        if num_cols:
+            info.append(f"Числовые колонки: {', '.join(num_cols[:6])}{' …' if len(num_cols)>6 else ''}")
+            # Проба сумм/средних
+            for col in num_cols[:3]:
+                s = float(df[col].sum())
+                m = float(df[col].mean())
+                info.append(f"Σ {col}: {s:,.2f} | μ {col}: {m:,.2f}".replace(",", " "))
+        # Возможная дата
+        dt_cols = [c for c in df.columns if re.search(r"date|дата|time|время", str(c), re.I)]
+        if dt_cols:
+            info.append(f"Дата-колонки: {', '.join(dt_cols[:3])}")
+    except Exception:
+        pass
+    return "\n".join(info)
+
+# ------------------------------
+# 🧪 ДЕМО-РЕЖИМ
+# ------------------------------
+async def handle_demo_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
+    user = update.effective_user
+    st = get_state(user.id)
+
+    if txt.lower().startswith("да"):
+        if "demo_q" not in st.answers:
+            st.answers["demo_q"] = 1
+            await update.message.reply_text("1/3: В двух фразах — что продаёшь и кому?", reply_markup=back_main_buttons())
+            return
+        if st.answers["demo_q"] == 1:
+            st.answers["demo_prod"] = txt
+            st.answers["demo_q"] = 2
+            await update.message.reply_text("2/3: Где сейчас берёшь трафик? (каналы)", reply_markup=back_main_buttons())
+            return
+        if st.answers["demo_q"] == 2:
+            st.answers["demo_channels"] = txt
+            st.answers["demo_q"] = 3
+            await update.message.reply_text("3/3: Какая цель на 30–60 дней? (выручка/лидов/запуск)", reply_markup=back_main_buttons())
+            return
+        if st.answers["demo_q"] == 3:
+            st.answers["demo_goal"] = txt
+            # Генерация идей
+            prompt = (
+                "Сгенерируй 6 быстрых гипотез роста для бизнеса на 30–60 дней, с приоритетами и ожидаемым эффектом.\n"
+                f"Бизнес: {st.answers.get('demo_prod')}\n"
+                f"Каналы сейчас: {st.answers.get('demo_channels')}\n"
+                f"Цель: {st.answers.get('demo_goal')}\n"
+                "Формат: нумерованный список, по каждой — идея, зачем, метрика, первый шаг."
+            )
+            ideas = await chatgpt_answer(prompt)
+            await update.message.reply_text("Готово! Вот идеи, с которых можно стартовать:\n\n" + sanitize(ideas, 3500), reply_markup=MAIN_MENU)
+            st.stage = "idle"
+            st.answers.pop("demo_q", None)
+            return
+
+    if txt.lower().startswith("позже"):
+        st.stage = "idle"
+        await update.message.reply_text("Окей, вернёмся позже. Чем ещё помочь?", reply_markup=MAIN_MENU)
+        return
+
+    # Любой другой текст в демо — считаем ответом на текущий вопрос
+    await handle_demo_flow(update, context, "да")
+
+# ------------------------------
+# 🧭 ДИАГНОСТИКА: ЛОГИКА
+# ------------------------------
+async def handle_diagnostic_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
+    user = update.effective_user
+    st = get_state(user.id)
+
+    if st.diagnostic_step == 0:
+        if txt.lower().startswith("да"):
+            st.stage = "diag_running"
+            st.diagnostic_step = 1
+            await update.message.reply_text("Начинаем. Отвечай коротко, можно пунктами.\n\n" + DIAG_QUESTIONS[0][1], reply_markup=back_main_buttons())
+            return
+        else:
+            await update.message.reply_text("Хорошо, когда будешь готов — нажми «Диагностика бизнеса».", reply_markup=MAIN_MENU)
+            st.stage = "idle"
+            return
+
+    # Сохранение ответа на предыдущий вопрос
+    if 1 <= st.diagnostic_step <= len(DIAG_QUESTIONS):
+        key_prev, _ = DIAG_QUESTIONS[st.diagnostic_step - 1]
+        st.answers[key_prev] = txt
+
+    # Переход к следующему
+    if st.diagnostic_step < len(DIAG_QUESTIONS):
+        key, q = DIAG_QUESTIONS[st.diagnostic_step]
+        st.diagnostic_step += 1
+        await update.message.reply_text(q, reply_markup=back_main_buttons())
+        return
+
+    # После основного блока — конкуренты
+    if st.diagnostic_step == len(DIAG_QUESTIONS):
+        st.diagnostic_step += 1
+        await update.message.reply_text(
+            "🕵️ Теперь пришли 2–5 ссылок на конкурентов (сайты, соцсети, маркетплейсы, Telegram-каналы).\n"
+            "Если не знаешь — напиши «Нет», и я сам подберу аналоги."
+        )
+        return
+
+    # Получение ссылок конкурентов
+    if st.diagnostic_step == len(DIAG_QUESTIONS) + 1:
+        links = re.findall(r'(https?://\S+)', txt)
+        if links:
+            st.competitors = links[:5]
+            await update.message.reply_text("Принял ссылки конкурентов 🔍", reply_markup=None)
+        else:
+            await update.message.reply_text("Хорошо, подберу аналоги сам.")
+        st.diagnostic_step += 1
+        # Предложить анализ конкурентов
+        await update.message.reply_text(
+            "Что хочешь узнать в первую очередь?",
+            reply_markup=INLINE_COMP_MENU
+        )
+        return
+
+# ------------------------------
+# 🔎 КНОПКИ АНАЛИЗА КОНКУРЕНТОВ И ОТЧЁТ
+# ------------------------------
+async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    st = get_state(user.id)
+    q = update.callback_query
+    data = q.data
+    await q.answer()
+
+    if data == "start_diag":
+        st.stage = "diag"
+        st.diagnostic_step = 0
+        await q.message.reply_text(
+            "📊 Диагностика — стратегический брифинг. Готов начать?",
+            reply_markup=yes_later_buttons()
+        )
+        return
+
+    if data == "get_presentation":
+        await q.message.reply_text("Отправил запрос на презентацию. Менеджер свяжется с тобой в ближайшее время ✅")
+        return
+
+    if data == "get_report":
+        # Сформировать итоговый отчёт и показать меню секций
+        txt = await make_final_report(user, st)
+        await q.message.reply_text("Готово ✅\nНиже — краткий отчёт и рекомендации.", reply_markup=report_menu())
+        await q.message.reply_text(sanitize(txt, 3500), reply_markup=report_menu())
+        st.chat_mode = True
+        st.chat_history = []
+        return
+
+    if data == "plan_30d":
+        # 30-дневный пошаговый план
+        prompt = (
+            "Составь пошаговый 30-дневный план внедрения приоритетов: неделя за неделей,"
+            " задачи, ответственные роли, метрики успеха, ожидаемый эффект, чек-лист.\n"
+            f"Вводные (кратко): {json.dumps(st.answers, ensure_ascii=False)[:1200]}"
+        )
+        plan = await chatgpt_answer(prompt)
+        await q.message.reply_text(sanitize(plan, 3500), reply_markup=report_menu())
+        st.chat_mode = True
+        st.chat_history = []
+        st.chat_history.append({"role": "assistant", "content": comp_text})
+        return
+
+    # Анализ конкурентов — выбор раздела
+    if data in ("comp_prices", "comp_content", "comp_product", "comp_all", "comp_back"):
+        if data == "comp_back":
+            await q.message.reply_text("Ок, продолжаем.", reply_markup=None)
+        else:
+            section_map = {
+                "comp_prices": "Цены и позиционирование",
+                "comp_content": "Контент и продвижение",
+                "comp_product": "Продукт и предложения",
+                "comp_all": "Все разделы вместе"
+            }
+            section = section_map[data]
+            comp_text = await generate_competitor_review(st, section)
+            await q.message.reply_text(comp_text, disable_web_page_preview=True)
+            st.chat_mode = True
+            st.chat_history = []
+            st.chat_history.append({"role": "assistant", "content": comp_text})
+        return
+
+# Генерация обзора конкурентов
+async def generate_competitor_review(st: UserState, focus: str) -> str:
+    comps = "\n".join(st.competitors) if st.competitors else "Нет ссылок; подбери аналоги по нише."
+    prompt = (
+        "Сделай краткий обзор конкурентов по нише пользователя.\n"
+        f"Ссылки/подсказки:\n{comps}\n\n"
+        f"Фокус: {focus}\n"
+        "Формат: 1) Наблюдения 2) Отличия 3) Риски 4) Возможности 5) 3 шага обойти конкурентов."
+    )
+    return await chatgpt_answer(prompt)
+
+# ------------------------------
+# 📄 ИТОГОВЫЙ ОТЧЁТ
+# ------------------------------
+async def make_final_report(user: Any, st: UserState) -> str:
+    sales_block = st.sales_df_summary or "Нет файла продаж. Рекомендую выгрузку для поиска потерь."
+    prompt = (
+        "Сформируй итоговый отчёт AI-маркетолога 360° по 7 направлениям (кратко, по делу):\n"
+        "Направления: Продукт, Клиенты (ЦА), Продажи, Маркетинг, Команда, Конкуренты, Цифры.\n"
+        "В конце — приоритеты на 30 дней (5 пунктов).\n\n"
+        f"Исходные ответы пользователя (JSON): {json.dumps(st.answers, ensure_ascii=False)}\n"
+        f"Аналитика по файлу продаж (если есть): {sales_block}\n"
+        f"Ссылки конкурентов: {', '.join(st.competitors) if st.competitors else 'нет'}\n"
+        "Стиль: чётко, маркдаун, без воды."
+    )
+    full = await chatgpt_answer(prompt)
+    st.last_report_text = full
+
+    # Выделим секции для быстрого меню
+    parts = {
+        "Продукт 📦": r"(?si)продукт.*?(?=\n#|\Z)",
+        "Целевая аудитория 🎯": r"(?si)(целев(ая|ая аудитория)|клиент).*?(?=\n#|\Z)",
+        "Продажи 💰": r"(?si)продаж[аи].*?(?=\n#|\Z)",
+        "Маркетинг 📣": r"(?si)маркетинг.*?(?=\n#|\Z)",
+        "Команда 👥": r"(?si)команд[аи].*?(?=\n#|\Z)",
+        "Конкуренты ⚔️": r"(?si)конкурент[ы|ы].*?(?=\n#|\Z)",
+        "Цифры и аналитика 📊": r"(?si)(цифр|аналитик).*?(?=\n#|\Z)",
+        "Приоритеты ⚡️": r"(?si)(приоритет|30 дней|шаг[аи]).*?(?=\n#|\Z)",
+    }
+    st.last_report_sections = {}
+    for title, regex in parts.items():
+        m = re.search(regex, full)
+        if m:
+            st.last_report_sections[title] = m.group(0).strip()
+    return full
+
+async def show_report_section(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str):
+    user = update.effective_user
+    st = get_state(user.id)
+    if not st.last_report_text:
+        await update.message.reply_text("Сначала нужно завершить диагностику, чтобы сформировать отчёт.", reply_markup=MAIN_MENU)
+        return
+    body = st.last_report_sections.get(title) or "Эта секция не выделена отдельно. См. общий отчёт."
+    await update.message.reply_text(f"*{title}*\n\n{body}", parse_mode=ParseMode.MARKDOWN, reply_markup=report_menu())
+
+async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    st = get_state(user.id)
+    if not st.last_report_text:
+        await update.message.reply_text("Сначала сформируй отчёт, а затем можно экспортировать в PDF.", reply_markup=MAIN_MENU)
+        return
+    pdf_bytes = make_pdf_report(
+        username=user.full_name or user.username or f"id:{user.id}",
+        summary_text=st.last_report_text,
+        sections=st.last_report_sections or {}
+    )
+    await update.message.reply_document(document=InputFile(io.BytesIO(pdf_bytes), filename="ai_marketer_360_report.pdf"), caption="Отчёт готов 📁")
+
+# ------------------------------
+# 🧵 ЗАВЕРШЕНИЕ ДИАГНОСТИКИ (ТРИГГЕР)
+# ------------------------------
+async def maybe_finish_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Когда пользователь закончил конкурентов/файл — предложим итоговый отчёт."""
+    user = update.effective_user
+    st = get_state(user.id)
+    if st.stage in ("await_sales_file", "diag_running"):
+        # Ничего не делаем автоматически — ждём команды пользователя.
+        return
+
+# ------------------------------
+# 🛡️ ОБЩИЙ ОБРАБОТЧИК ОШИБОК
+# ------------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("Exception while handling an update:", file=os.sys.stderr)
+    traceback.print_exception(None, context.error, context.error.__traceback__)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("Ой! Сервисная ошибка. Уже чищу хвосты — попробуй ещё раз 🙌")
+    except Exception:
+        pass
+
+# ------------------------------
+# 🌐 РОУТИНГ CALLBACK И ТЕКСТА
+# ------------------------------
+async def any_message_postprocess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Хук на будущее. Сейчас ничего.
+    return
+
+# ------------------------------
+# ▶️ MAIN
+# ------------------------------
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    # Callback-кнопки
+    app.add_handler(CallbackQueryHandler(cb_handler))
+
+    # Документы (CSV/XLSX)
+    app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+
+    # Текстовый роутер
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    # Постобработка (необязательно)
+    app.add_handler(MessageHandler(filters.ALL, any_message_postprocess))
+
+    # Ошибки
+    app.add_error_handler(error_handler)
+
+    print("🤖 Бот запущен. Нажми Ctrl+C для остановки.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
