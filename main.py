@@ -183,6 +183,38 @@ def sanitize(text: str, max_len: int = 3500) -> str:
         return text[:max_len] + "…"
     return text
 
+
+def split_for_telegram(text: str, chunk_size: int = 3500) -> List[str]:
+    cleaned = (text or "").replace("\x00", " ").strip()
+    if not cleaned:
+        return ["(пустой ответ)"]
+    parts: List[str] = []
+    remaining = cleaned
+    while remaining:
+        if len(remaining) <= chunk_size:
+            parts.append(remaining)
+            break
+        split_idx = remaining.rfind("\n", 0, chunk_size)
+        if split_idx == -1 or split_idx < chunk_size * 0.5:
+            split_idx = remaining.rfind(" ", 0, chunk_size)
+        if split_idx == -1 or split_idx < chunk_size * 0.5:
+            split_idx = chunk_size
+        parts.append(remaining[:split_idx].strip())
+        remaining = remaining[split_idx:].lstrip()
+    return [p for p in parts if p]
+
+
+async def send_split_text(message_obj, text: str, *, parse_mode=None, disable_preview: bool = True, reply_markup=None):
+    chunks = split_for_telegram(text)
+    for idx, chunk in enumerate(chunks):
+        kwargs = {
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": disable_preview,
+        }
+        if idx == len(chunks) - 1 and reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        await message_obj.reply_text(chunk, **kwargs)
+
 # ------------------------------
 # 🗂️ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ
 # ------------------------------
@@ -207,6 +239,31 @@ def get_state(user_id: int) -> UserState:
 
 def reset_state(user_id: int):
     STATE[user_id] = UserState()
+
+
+BOLTALKA_HINT_TEXT = (
+    "💬 Болталка включена. Можешь задавать уточняющие вопросы в свободной форме.\n"
+    "Чтобы выйти, нажми «⬅️ В главное меню»."
+)
+
+
+def reset_boltalka_context(st: UserState, last_user_text: Optional[str], assistant_text: str):
+    st.chat_mode = True
+    st.chat_history = []
+    if last_user_text:
+        st.chat_history.append({"role": "user", "content": last_user_text})
+    if assistant_text:
+        st.chat_history.append({"role": "assistant", "content": assistant_text})
+
+
+async def send_boltalka_hint(message_obj):
+    await message_obj.reply_text(BOLTALKA_HINT_TEXT, reply_markup=back_main_buttons())
+
+
+async def send_gpt_reply(message_obj, st: UserState, answer: str, *, last_user_text: Optional[str] = None, parse_mode=None):
+    await send_split_text(message_obj, answer, parse_mode=parse_mode)
+    reset_boltalka_context(st, last_user_text, answer)
+    await send_boltalka_hint(message_obj)
 
 # ------------------------------
 # 📋 ВОПРОСЫ ДИАГНОСТИКИ (СОКР. + РАСШ.)
@@ -470,7 +527,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Ввод: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -485,7 +542,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Дано: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -500,7 +557,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Дано: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -515,7 +572,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Дано: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -525,7 +582,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             " Формат: этапы (2 недели, 30 дней, 60 дней), инструменты, метрики, риски."
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=AI_MARKETER_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         return
 
     # Подменю: Генерация контента
@@ -543,7 +600,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Ввод: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -557,7 +614,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Тема: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -571,7 +628,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Тема: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -585,7 +642,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Ввод: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -599,7 +656,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" Дано: {txt}"
         )
         ans = await chatgpt_answer(prompt)
-        await update.message.reply_text(sanitize(ans), reply_markup=CONTENT_MENU)
+        await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
 
@@ -704,7 +761,8 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # сохраняем ответ
     st.chat_history.append({"role": "assistant", "content": answer})
 
-    await update.message.reply_text(answer)
+    await send_split_text(update.message, answer)
+    await send_boltalka_hint(update.message)
 
 
 # ------------------------------
@@ -796,7 +854,12 @@ async def handle_demo_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 "Формат: нумерованный список, по каждой — идея, зачем, метрика, первый шаг."
             )
             ideas = await chatgpt_answer(prompt)
-            await update.message.reply_text("Готово! Вот идеи, с которых можно стартовать:\n\n" + sanitize(ideas, 3500), reply_markup=MAIN_MENU)
+            await send_gpt_reply(
+                update.message,
+                st,
+                "Готово! Вот идеи, с которых можно стартовать:\n\n" + ideas,
+                last_user_text=txt
+            )
             st.stage = "idle"
             st.answers.pop("demo_q", None)
             return
@@ -890,10 +953,9 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "get_report":
         # Сформировать итоговый отчёт и показать меню секций
         txt = await make_final_report(user, st)
-        await q.message.reply_text("Готово ✅\nНиже — краткий отчёт и рекомендации.", reply_markup=report_menu())
-        await q.message.reply_text(sanitize(txt, 3500), reply_markup=report_menu())
-        st.chat_mode = True
-        st.chat_history = []
+        await q.message.reply_text("Готово ✅\nНиже — краткий отчёт и рекомендации.")
+        await send_gpt_reply(q.message, st, txt)
+        st.stage = "idle"
         return
 
     if data == "plan_30d":
@@ -904,10 +966,8 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Вводные (кратко): {json.dumps(st.answers, ensure_ascii=False)[:1200]}"
         )
         plan = await chatgpt_answer(prompt)
-        await q.message.reply_text(sanitize(plan, 3500), reply_markup=report_menu())
-        st.chat_mode = True
-        st.chat_history = []
-        st.chat_history.append({"role": "assistant", "content": comp_text})
+        await send_gpt_reply(q.message, st, plan)
+        st.stage = "idle"
         return
 
     # Анализ конкурентов — выбор раздела
@@ -923,10 +983,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             section = section_map[data]
             comp_text = await generate_competitor_review(st, section)
-            await q.message.reply_text(comp_text, disable_web_page_preview=True)
-            st.chat_mode = True
-            st.chat_history = []
-            st.chat_history.append({"role": "assistant", "content": comp_text})
+            await send_gpt_reply(q.message, st, comp_text)
         return
 
 # Генерация обзора конкурентов
