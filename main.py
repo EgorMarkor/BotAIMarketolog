@@ -302,6 +302,32 @@ DIAG_QUESTIONS = [
 ]
 
 # ------------------------------
+# ▶️ СТАРТ ДИАГНОСТИКИ
+# ------------------------------
+async def start_diagnostic_session(message_obj, st: UserState):
+    """Запускает диагностику без дополнительных подтверждений."""
+    st.stage = "diag_running"
+    st.diagnostic_step = 1
+    st.answers = {}
+    st.competitors = []
+    st.last_report_text = None
+    st.last_report_sections = {}
+    st.chat_mode = False
+
+    intro = (
+        "📊 Диагностика — стратегический брифинг.\n"
+        "После ответов покажу состояние бизнеса, точки роста и приоритеты.\n"
+        "Отвечай коротко, можно пунктами. Это займёт 3–5 минут."
+    )
+    await message_obj.reply_text(intro, reply_markup=back_main_buttons())
+
+    first_question = DIAG_QUESTIONS[0][1]
+    await message_obj.reply_text(
+        "Начинаем.\n\n" + first_question,
+        reply_markup=back_main_buttons()
+    )
+
+# ------------------------------
 # 🖨️ PDF-ОТЧЁТ (ReportLab)
 # ------------------------------
 from reportlab.lib.pagesizes import A4
@@ -391,7 +417,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Предлагаю провести диагностику, чтобы показать стратегию 360°."
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU)
-    await update.message.reply_text("Готов начать диагностику?", reply_markup=INLINE_START_DIAG)
+    await update.message.reply_text(
+        "Готов пройти диагностику? Нажми кнопку ниже — и сразу начнём.",
+        reply_markup=INLINE_START_DIAG
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -445,13 +474,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2️⃣ Диагностика бизнеса
     if "Диагностика бизнеса" in txt or txt == "Пройти диагностику 🚀" or txt == "Начать диагностику 🚀":
-        st.stage = "diag"
-        st.diagnostic_step = 0
-        await update.message.reply_text(
-            "📊 Диагностика — стратегический брифинг.\nПосле ответов покажу картину состояния, точки роста и приоритеты.\n\nГотов начать?"
-            " Напиши «да», когда будешь готов или скажи «позже».",
-            reply_markup=back_main_buttons()
-        )
+        await start_diagnostic_session(update.message, st)
         return
 
     # 3️⃣ Что я умею
@@ -855,16 +878,18 @@ async def handle_diagnostic_flow(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     st = get_state(user.id)
 
-    if st.diagnostic_step == 0:
-        if txt.lower().startswith("да"):
-            st.stage = "diag_running"
-            st.diagnostic_step = 1
-            await update.message.reply_text("Начинаем. Отвечай коротко, можно пунктами.\n\n" + DIAG_QUESTIONS[0][1], reply_markup=back_main_buttons())
-            return
-        else:
-            await update.message.reply_text("Хорошо, когда будешь готов — нажми «Диагностика бизнеса».", reply_markup=MAIN_MENU)
-            st.stage = "idle"
-            return
+    lower_txt = txt.lower().strip()
+
+    if lower_txt.startswith("позже"):
+        st.stage = "idle"
+        st.diagnostic_step = 0
+        await update.message.reply_text("Окей, вернёмся позже. Чем ещё помочь?", reply_markup=MAIN_MENU)
+        return
+
+    if st.diagnostic_step <= 0:
+        await update.message.reply_text("Чтобы начать диагностику, нажми «Диагностика бизнеса» в главном меню.", reply_markup=MAIN_MENU)
+        st.stage = "idle"
+        return
 
     # Сохранение ответа на предыдущий вопрос
     if 1 <= st.diagnostic_step <= len(DIAG_QUESTIONS):
@@ -940,12 +965,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if data == "start_diag":
-        st.stage = "diag"
-        st.diagnostic_step = 0
-        await q.message.reply_text(
-            "📊 Диагностика — стратегический брифинг. Готов начать? Напиши «да» или скажи «позже».",
-            reply_markup=back_main_buttons()
-        )
+        await start_diagnostic_session(q.message, st)
         return
 
     if data == "get_presentation":
