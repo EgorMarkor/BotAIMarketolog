@@ -6,12 +6,13 @@
 import os
 import io
 import re
-import time
 import json
 import math
 import traceback
+import asyncio
+import contextlib
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Awaitable
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -22,7 +23,7 @@ from telegram import (
     ReplyKeyboardMarkup, KeyboardButton,
     InputFile
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes,
     CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -149,7 +150,8 @@ async def chatgpt_answer(prompt: str, system: str = None, temperature: float = T
     last_err = None
     for attempt in range(OPENAI_RETRIES):
         try:
-            resp = client.chat.completions.create(
+            resp = await asyncio.to_thread(
+                client.chat.completions.create,
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": sys_msg},
@@ -169,7 +171,7 @@ async def chatgpt_answer(prompt: str, system: str = None, temperature: float = T
 
         except Exception as e:
             last_err = e
-            time.sleep(0.8 * (attempt + 1))
+            await asyncio.sleep(0.8 * (attempt + 1))
     raise last_err
 
 def sanitize(text: str, max_len: int = 3500) -> str:
@@ -199,6 +201,115 @@ def split_for_telegram(text: str, chunk_size: int = 3500) -> List[str]:
         parts.append(remaining[:split_idx].strip())
         remaining = remaining[split_idx:].lstrip()
     return [p for p in parts if p]
+
+
+async def _typing_pulse(bot, chat_id: int):
+    try:
+        while True:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_with_typing_indicator(bot, chat_id: Optional[int], awaitable: Awaitable[Any]):
+    if bot is None or chat_id is None:
+        return await awaitable
+
+    typing_task = asyncio.create_task(_typing_pulse(bot, chat_id))
+    try:
+        return await awaitable
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
+
+
+async def ask_gpt_with_typing(bot, chat_id: Optional[int], prompt: str, *, system: str = None, temperature: float = TEMPERATURE) -> str:
+    return await run_with_typing_indicator(
+        bot,
+        chat_id,
+        chatgpt_answer(prompt, system=system, temperature=temperature)
+    )
+
+
+def format_gpt_answer_for_telegram(text: str) -> str:
+    """Преобразует ответ в аккуратные блоки с заголовками и маркерами."""
+    if not text:
+        return ""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    def prettify_heading(raw: str) -> str:
+        cleaned = re.sub(r"^#{1,6}\s*", "", raw).strip()
+        cleaned = re.sub(r"^[\-•—\*]+\s*", "", cleaned)
+        cleaned = re.sub(r"^\d+[)\.\-–]\s*", "", cleaned)
+        cleaned = cleaned.strip().strip("*")
+        cleaned = cleaned.rstrip(":：")
+        if ":" in cleaned:
+            left, right = cleaned.split(":", 1)
+            if right.strip():
+                cleaned = f"{left.strip()} — {right.strip()}"
+            else:
+                cleaned = left.strip()
+        return cleaned
+
+    def format_bullet(body: str, indent: int) -> str:
+        body = body.strip()
+        body = body.strip("*-—• ")
+        body = re.sub(r"^\d+[)\.\-–]\s*", "", body).strip()
+        if not body:
+            return ""
+        indent_level = min(max(indent // 2, 0), 3)
+        prefix = "  " * indent_level
+        return f"{prefix}• {body}"
+
+    formatted_lines: List[str] = []
+    blank_pending = False
+    last_type = ""
+
+    for raw_line in normalized.split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            blank_pending = True
+            continue
+
+        indent = len(line) - len(line.lstrip(" "))
+        line_type = "text"
+        formatted = ""
+
+        if stripped.startswith("#"):
+            line_type = "header"
+            formatted = f"🔷 {prettify_heading(stripped)}"
+        elif (stripped.startswith("**") and stripped.endswith("**")) or (stripped.endswith(":") and len(stripped.split()) <= 6):
+            line_type = "subheader"
+            formatted = f"▫️ {prettify_heading(stripped)}"
+        else:
+            bullet_match = re.match(r"^([\-•\*]+|[–—]|\d+[\.\)])\s+(.*)$", stripped)
+            if bullet_match:
+                line_type = "bullet"
+                formatted = format_bullet(bullet_match.group(2), indent)
+            else:
+                formatted = stripped
+
+        if formatted:
+            if formatted_lines:
+                if blank_pending and formatted_lines[-1] != "":
+                    formatted_lines.append("")
+                elif line_type in ("header", "subheader") and formatted_lines[-1] != "":
+                    formatted_lines.append("")
+                elif line_type == "bullet" and last_type not in ("bullet", "subheader") and formatted_lines[-1] != "":
+                    formatted_lines.append("")
+
+            formatted_lines.append(formatted)
+            last_type = line_type
+            blank_pending = False
+
+    pretty = "\n".join(line for line in formatted_lines if line is not None).strip()
+    return pretty or normalized
 
 
 async def send_split_text(message_obj, text: str, *, parse_mode=None, disable_preview: bool = True, reply_markup=None):
@@ -258,7 +369,8 @@ async def send_boltalka_hint(message_obj):
 
 
 async def send_gpt_reply(message_obj, st: UserState, answer: str, *, last_user_text: Optional[str] = None, parse_mode=None):
-    await send_split_text(message_obj, answer, parse_mode=parse_mode)
+    formatted_answer = format_gpt_answer_for_telegram(answer)
+    await send_split_text(message_obj, formatted_answer, parse_mode=parse_mode)
     reset_boltalka_context(st, last_user_text, answer)
     await send_boltalka_hint(message_obj)
 
@@ -418,7 +530,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     st = get_state(user.id)
     txt = (update.message.text or "").strip()
-    
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
     user_id = user.id
     log_event(
         user_id=user_id,
@@ -501,7 +614,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             " Формат: 1) Краткое резюме 2) Точки роста 3) Быстрые действия на 7 дней 4) Метрики.\n"
             f"Ввод: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -516,7 +629,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Составь конспект стратегии на 90 дней: цели, каналы, гипотезы, вехи по неделям, риски, метрики."
             f" Дано: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -531,7 +644,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Составь контент-план на 2 недели: 14 постов/роликов с идеей, тезисами, CTA и метрикой."
             f" Дано: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -546,7 +659,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Подбери 5 каналов трафика с обоснованием, старт-бюджетом, первыми шагами и основными рисками."
             f" Дано: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -556,7 +669,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Дай дорожную карту внедрения AI в SMB: контент, продажи, поддержка, аналитика, алерты, интеграции."
             " Формат: этапы (2 недели, 30 дней, 60 дней), инструменты, метрики, риски."
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         return
 
@@ -574,7 +687,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Сгенерируй 10 идей Reels/Shorts: хук, сюжет в 3 шага, финальный CTA, хронометраж до 30 сек."
             f" Ввод: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -588,7 +701,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Сгенерируй 20 заголовков: 5 инфо, 5 выгода, 5 триггер, 5 проблематика."
             f" Тема: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -602,7 +715,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Напиши 3 варианта поста/описания: краткий, подробный, продающий. Добавь CTA и эмодзи."
             f" Тема: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -616,7 +729,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Сформируй таблицей план на 14 дней: формат, идея, тезисы, CTA, цель метрики."
             f" Ввод: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -630,7 +743,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Сгенерируй 8 баннерных текстов: короткие (до 6 слов), оффер+боль, срочность, соц.доказательства."
             f" Дано: {txt}"
         )
-        ans = await chatgpt_answer(prompt)
+        ans = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(update.message, st, ans, last_user_text=txt)
         st.stage = "idle"
         return
@@ -704,6 +817,7 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     st = get_state(user.id)
     txt = update.message.text.strip()
+    chat_id = update.effective_chat.id if update.effective_chat else None
 
     # добавляем сообщение в историю
     st.chat_history.append({"role": "user", "content": txt})
@@ -725,17 +839,23 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages.extend(st.chat_history)
 
     # вызываем OpenAI
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        temperature=TEMPERATURE,
+    resp = await run_with_typing_indicator(
+        context.bot,
+        chat_id,
+        asyncio.to_thread(
+            client.chat.completions.create,
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=TEMPERATURE,
+        )
     )
     answer = resp.choices[0].message.content.strip()
 
     # сохраняем ответ
     st.chat_history.append({"role": "assistant", "content": answer})
 
-    await send_split_text(update.message, answer)
+    formatted_answer = format_gpt_answer_for_telegram(answer)
+    await send_split_text(update.message, formatted_answer)
     await send_boltalka_hint(update.message)
 
 
@@ -801,6 +921,7 @@ def summarize_sales_df(df: pd.DataFrame) -> str:
 async def handle_demo_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
     user = update.effective_user
     st = get_state(user.id)
+    chat_id = update.effective_chat.id if update.effective_chat else None
 
     if txt.lower().startswith("да"):
         if "demo_q" not in st.answers:
@@ -827,7 +948,7 @@ async def handle_demo_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 f"Цель: {st.answers.get('demo_goal')}\n"
                 "Формат: нумерованный список, по каждой — идея, зачем, метрика, первый шаг."
             )
-            ideas = await chatgpt_answer(prompt)
+            ideas = await ask_gpt_with_typing(context.bot, chat_id, prompt)
             await send_gpt_reply(
                 update.message,
                 st,
@@ -905,6 +1026,7 @@ async def finalize_diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Собирает отчёт, включает болталку и показывает дальнейшие шаги."""
     user = update.effective_user
     st = get_state(user.id)
+    chat_id = update.effective_chat.id if update.effective_chat else None
 
     if st.stage not in ("diag", "diag_running"):
         return
@@ -913,7 +1035,7 @@ async def finalize_diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE
     st.diagnostic_step = 0
 
     await update.message.reply_text("Формирую итоговый отчёт и план…")
-    report_text = await make_final_report(user, st)
+    report_text = await make_final_report(user, st, bot=context.bot, chat_id=chat_id)
 
     await send_gpt_reply(update.message, st, report_text)
     await update.message.reply_text(
@@ -930,6 +1052,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
     await q.answer()
+    chat_id = update.effective_chat.id if update.effective_chat else None
 
     if data == "start_diag":
         await start_diagnostic_session(q.message, st)
@@ -941,7 +1064,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "get_report":
         # Сформировать итоговый отчёт и показать меню секций
-        txt = await make_final_report(user, st)
+        txt = await make_final_report(user, st, bot=context.bot, chat_id=chat_id)
         await q.message.reply_text("Готово ✅\nНиже — краткий отчёт и рекомендации.")
         await send_gpt_reply(q.message, st, txt)
         st.stage = "idle"
@@ -954,7 +1077,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             " задачи, ответственные роли, метрики успеха, ожидаемый эффект, чек-лист.\n"
             f"Вводные (кратко): {json.dumps(st.answers, ensure_ascii=False)[:1200]}"
         )
-        plan = await chatgpt_answer(prompt)
+        plan = await ask_gpt_with_typing(context.bot, chat_id, prompt)
         await send_gpt_reply(q.message, st, plan)
         st.stage = "idle"
         return
@@ -971,12 +1094,12 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "comp_all": "Все разделы вместе"
             }
             section = section_map[data]
-            comp_text = await generate_competitor_review(st, section)
+            comp_text = await generate_competitor_review(st, section, bot=context.bot, chat_id=chat_id)
             await send_gpt_reply(q.message, st, comp_text)
         return
 
 # Генерация обзора конкурентов
-async def generate_competitor_review(st: UserState, focus: str) -> str:
+async def generate_competitor_review(st: UserState, focus: str, *, bot=None, chat_id: Optional[int] = None) -> str:
     comps = "\n".join(st.competitors) if st.competitors else "Нет ссылок; подбери аналоги по нише."
     prompt = (
         "Сделай краткий обзор конкурентов по нише пользователя.\n"
@@ -984,12 +1107,12 @@ async def generate_competitor_review(st: UserState, focus: str) -> str:
         f"Фокус: {focus}\n"
         "Формат: 1) Наблюдения 2) Отличия 3) Риски 4) Возможности 5) 3 шага обойти конкурентов."
     )
-    return await chatgpt_answer(prompt)
+    return await ask_gpt_with_typing(bot, chat_id, prompt)
 
 # ------------------------------
 # 📄 ИТОГОВЫЙ ОТЧЁТ
 # ------------------------------
-async def make_final_report(user: Any, st: UserState) -> str:
+async def make_final_report(user: Any, st: UserState, *, bot=None, chat_id: Optional[int] = None) -> str:
     sales_block = st.sales_df_summary or "Нет файла продаж. Рекомендую выгрузку для поиска потерь."
     prompt = (
         "Сформируй итоговый отчёт AI-маркетолога 360° по 7 направлениям (кратко, по делу):\n"
@@ -1000,7 +1123,7 @@ async def make_final_report(user: Any, st: UserState) -> str:
         f"Ссылки конкурентов: {', '.join(st.competitors) if st.competitors else 'нет'}\n"
         "Стиль: чётко, маркдаун, без воды."
     )
-    full = await chatgpt_answer(prompt)
+    full = await ask_gpt_with_typing(bot, chat_id, prompt)
     st.last_report_text = full
 
     # Выделим секции для быстрого меню
