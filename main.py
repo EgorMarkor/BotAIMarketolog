@@ -89,9 +89,6 @@ def aux_menu():
 def back_main_buttons():
     return ReplyKeyboardMarkup([["⬅️ В главное меню"]], resize_keyboard=True)
 
-def yes_later_buttons():
-    return ReplyKeyboardMarkup([["Да, поехали 🚀"], ["Позже"]], resize_keyboard=True)
-
 def report_menu():
     return ReplyKeyboardMarkup([
         ["Продукт 📦", "Целевая аудитория 🎯"],
@@ -440,9 +437,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Демо-режим 🧠\n"
             "Покажу, как нахожу точки роста и формирую гипотезы.\n\n"
             "Готов пройти мини-тест (3 вопроса) и получить идеи?"
+            " Напиши «да», когда будешь готов или скажи «позже»."
         )
         st.stage = "demo"
-        await update.message.reply_text(msg, reply_markup=yes_later_buttons())
+        await update.message.reply_text(msg, reply_markup=back_main_buttons())
         return
 
     # 2️⃣ Диагностика бизнеса
@@ -450,8 +448,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.stage = "diag"
         st.diagnostic_step = 0
         await update.message.reply_text(
-            "📊 Диагностика — стратегический брифинг.\nПосле ответов покажу картину состояния, точки роста и приоритеты.\n\nГотов начать?",
-            reply_markup=yes_later_buttons()
+            "📊 Диагностика — стратегический брифинг.\nПосле ответов покажу картину состояния, точки роста и приоритеты.\n\nГотов начать?"
+            " Напиши «да», когда будешь готов или скажи «позже».",
+            reply_markup=back_main_buttons()
         )
         return
 
@@ -902,7 +901,33 @@ async def handle_diagnostic_flow(update: Update, context: ContextTypes.DEFAULT_T
             "Что хочешь узнать в первую очередь?",
             reply_markup=INLINE_COMP_MENU
         )
+        await finalize_diagnostic(update, context)
         return
+
+
+async def finalize_diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Собирает отчёт, включает болталку и показывает дальнейшие шаги."""
+    user = update.effective_user
+    st = get_state(user.id)
+
+    if st.stage not in ("diag", "diag_running"):
+        return
+
+    st.stage = "diag_complete"
+    st.diagnostic_step = 0
+
+    await update.message.reply_text("Формирую итоговый отчёт и план…")
+    report_text = await make_final_report(user, st)
+
+    await update.message.reply_text(
+        "Готово ✅ Ниже — быстрые действия после диагностики.",
+        reply_markup=INLINE_GROWTH_MENU
+    )
+    await send_gpt_reply(update.message, st, report_text)
+    await update.message.reply_text(
+        "Нужно углубиться в конкретный блок? Выбери раздел отчёта или просто продолжай диалог.",
+        reply_markup=report_menu()
+    )
 
 # ------------------------------
 # 🔎 КНОПКИ АНАЛИЗА КОНКУРЕНТОВ И ОТЧЁТ
@@ -918,8 +943,8 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.stage = "diag"
         st.diagnostic_step = 0
         await q.message.reply_text(
-            "📊 Диагностика — стратегический брифинг. Готов начать?",
-            reply_markup=yes_later_buttons()
+            "📊 Диагностика — стратегический брифинг. Готов начать? Напиши «да» или скажи «позже».",
+            reply_markup=back_main_buttons()
         )
         return
 
