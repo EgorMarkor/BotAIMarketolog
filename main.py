@@ -6,7 +6,7 @@
 import os
 import io
 import re
-import time
+import asyncio
 import json
 import math
 import traceback
@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ---- OpenAI SDK
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 import datetime
 
@@ -60,7 +60,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("Не заданы TELEGRAM_TOKEN / OPENAI_API_KEY в .env")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------
 # 🧩 КОНСТАНТЫ И ВСПОМОГАТЕЛЬНОЕ
@@ -148,7 +148,7 @@ async def chatgpt_answer(prompt: str, system: str = None, temperature: float = T
     last_err = None
     for attempt in range(OPENAI_RETRIES):
         try:
-            resp = client.chat.completions.create(
+            resp = await client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": sys_msg},
@@ -168,7 +168,7 @@ async def chatgpt_answer(prompt: str, system: str = None, temperature: float = T
 
         except Exception as e:
             last_err = e
-            time.sleep(0.8 * (attempt + 1))
+            await asyncio.sleep(0.8 * (attempt + 1))
     raise last_err
 
 def sanitize(text: str, max_len: int = 3500) -> str:
@@ -776,7 +776,7 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages.extend(st.chat_history)
 
     # вызываем OpenAI
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=TEMPERATURE,
