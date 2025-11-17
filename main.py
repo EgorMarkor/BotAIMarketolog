@@ -173,6 +173,17 @@ async def chatgpt_answer(prompt: str, system: str = None, temperature: float = T
             await asyncio.sleep(0.8 * (attempt + 1))
     raise last_err
 
+
+async def ask_gpt_with_typing(bot, chat_id: int, prompt: str, system: str = None, temperature: float = TEMPERATURE):
+    """Показывает статус typing и вызывает chatGPT с ретраями."""
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        pass
+
+    answer = await chatgpt_answer(prompt, system=system, temperature=temperature)
+    return answer
+
 def sanitize(text: str, max_len: int = 3500) -> str:
     if not text:
         return ""
