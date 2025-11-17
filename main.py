@@ -76,6 +76,7 @@ OPENAI_RETRIES = 3
 MAIN_MENU = ReplyKeyboardMarkup([
     ["🧭 Диагностика бизнеса"],
     ["🧬AI-Маркетолог", "☄️Генерация контента"],
+    ["🛠 Услуги"],
     ["📞 Связаться с командой"]
 ], resize_keyboard=True)
 
@@ -115,6 +116,26 @@ CONTENT_MENU = ReplyKeyboardMarkup([
     ["Создать презентацию 🔒️"],
     ["⬅️ В главное меню"]
 ], resize_keyboard=True)
+
+SERVICES = [
+    ("AI маркетолог", "2500/мес", "ai_marketer"),
+    ("Пакет на генерацию 25 изображений", "2500 руб", "img_25"),
+    ("Пакет на генерацию 50 изображений", "5000 руб", "img_50"),
+    ("Пакет на генерацию Reels/Shorts до 1 мин 10 шт", "2500 руб", "reels_10"),
+    ("Пакет 10 шт. на генерацию видео до 3 мин с Аватаром", "2500 руб", "video_avatar_10"),
+    ("Пакет на генерацию презентации (до 20 слайдов)", "1000 руб/преза", "presentation"),
+]
+
+SERVICES_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton(f"Купить: {name}", callback_data=f"buy_service_{code}")]
+    for name, _, code in SERVICES
+])
+
+SERVICES_TEXT = (
+    "Выбери услугу:\n"
+    + "\n".join([f"• {name} — {price}" for name, price, _ in SERVICES])
+    + "\n\nКнопки покупки пока без оплаты — сервис подключим позже."
+)
 
 INLINE_CONTACT = InlineKeyboardMarkup([
     [InlineKeyboardButton("Написать в Telegram менеджеру", url="https://t.me/maglena_a")]
@@ -213,12 +234,18 @@ def split_for_telegram(text: str, chunk_size: int = 3500) -> List[str]:
     return [p for p in parts if p]
 
 
+def strip_md_symbols(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[\*#]+", "", text)
+
+
 def format_gpt_answer_for_telegram(text: str) -> str:
-    """Делает структурированную выдачу для Telegram без Markdown/HTML."""
+    """Делает структурированную выдачу для Telegram без Markdown/HTML и символов * или #."""
     if not text:
         return ""
 
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = strip_md_symbols(text.replace("\r\n", "\n").replace("\r", "\n").strip())
     if not normalized:
         return ""
 
@@ -226,22 +253,22 @@ def format_gpt_answer_for_telegram(text: str) -> str:
     formatted_blocks: List[str] = []
 
     for block in blocks:
-        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        lines = [strip_md_symbols(ln.strip()) for ln in block.split("\n") if ln.strip()]
         if not lines:
             continue
 
         original_header = lines[0]
-        header_line = re.sub(r"^[\-•—\*]+\s*", "", original_header).strip()
-        header_line = re.sub(r"^\d+[)\.\-–]\s*", "", header_line).strip()
+        header_line = strip_md_symbols(re.sub(r"^[\-•—\*]+\s*", "", original_header).strip())
+        header_line = strip_md_symbols(re.sub(r"^\d+[)\.\-–]\s*", "", header_line).strip())
         if not header_line:
-            header_line = original_header.strip()
+            header_line = strip_md_symbols(original_header.strip())
 
         inline_body = ""
         if ":" in header_line:
             potential_header, potential_body = header_line.split(":", 1)
             if potential_body.strip():
-                inline_body = potential_body.strip()
-            header_line = potential_header.strip()
+                inline_body = strip_md_symbols(potential_body.strip())
+            header_line = strip_md_symbols(potential_header.strip())
 
         body_candidates = []
         if inline_body:
@@ -250,18 +277,19 @@ def format_gpt_answer_for_telegram(text: str) -> str:
 
         formatted_body = []
         for raw_line in body_candidates:
-            clean = re.sub(r"^[\-•—\*]+\s*", "", raw_line).strip()
-            clean = re.sub(r"^\d+[)\.\-–]\s*", "", clean).strip()
+            clean = strip_md_symbols(re.sub(r"^[\-•—\*]+\s*", "", raw_line).strip())
+            clean = strip_md_symbols(re.sub(r"^\d+[)\.\-–]\s*", "", clean).strip())
             if clean:
                 formatted_body.append(f"• {clean}")
 
         header_text = f"🔹 {header_line}" if header_line else ""
         if formatted_body:
-            formatted_blocks.append(header_text + "\n" + "\n".join(formatted_body))
+            formatted_blocks.append(strip_md_symbols(header_text + "\n" + "\n".join(formatted_body)))
         else:
-            formatted_blocks.append(header_text)
+            formatted_blocks.append(strip_md_symbols(header_text))
 
-    return "\n\n".join(formatted_blocks) if formatted_blocks else normalized
+    result = "\n\n".join(formatted_blocks) if formatted_blocks else normalized
+    return strip_md_symbols(result)
 
 
 async def send_split_text(message_obj, text: str, *, parse_mode=None, disable_preview: bool = True, reply_markup=None):
@@ -498,6 +526,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
         st.chat_mode = False
         st.chat_history = []
+        return
+
+    if txt in ("🛠 Услуги", "Услуги"):
+        await update.message.reply_text(SERVICES_TEXT, reply_markup=SERVICES_MENU)
         return
 
     # 1️⃣ Протестировать AI-маркетолога
@@ -1001,6 +1033,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     chat_id = update.effective_chat.id if update.effective_chat else None
 
+    if data.startswith("buy_service_"):
+        await q.answer("Покупка скоро будет доступна")
+        await q.message.reply_text("Покупка этой услуги скоро появится. Если нужно быстрее — напиши менеджеру.", reply_markup=INLINE_CONTACT)
+        return
+
     if data == "start_diag":
         await start_diagnostic_session(q.message, st)
         return
@@ -1068,7 +1105,7 @@ async def make_final_report(user: Any, st: UserState, *, bot=None, chat_id: Opti
         f"Исходные ответы пользователя (JSON): {json.dumps(st.answers, ensure_ascii=False)}\n"
         f"Аналитика по файлу продаж (если есть): {sales_block}\n"
         f"Ссылки конкурентов: {', '.join(st.competitors) if st.competitors else 'нет'}\n"
-        "Стиль: чётко, маркдаун, без воды."
+        "Стиль: чётко, без Markdown, не используй символы * и #."
     )
     full = await ask_gpt_with_typing(bot, chat_id, prompt)
     st.last_report_text = full
@@ -1098,7 +1135,8 @@ async def show_report_section(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Сначала нужно завершить диагностику, чтобы сформировать отчёт.", reply_markup=MAIN_MENU)
         return
     body = st.last_report_sections.get(title) or "Эта секция не выделена отдельно. См. общий отчёт."
-    await update.message.reply_text(f"*{title}*\n\n{body}", parse_mode=ParseMode.MARKDOWN, reply_markup=report_menu())
+    formatted_body = format_gpt_answer_for_telegram(f"{title}\n\n{body}")
+    await send_split_text(update.message, formatted_body, reply_markup=report_menu())
 
 async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
