@@ -6,6 +6,7 @@
 import os
 import io
 import re
+import asyncio
 import json
 import math
 import traceback
@@ -30,7 +31,7 @@ from telegram.ext import (
 )
 
 # ---- OpenAI SDK
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 import datetime
 
@@ -61,7 +62,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("Не заданы TELEGRAM_TOKEN / OPENAI_API_KEY в .env")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------
 # 🧩 КОНСТАНТЫ И ВСПОМОГАТЕЛЬНОЕ
@@ -109,15 +110,14 @@ AI_MARKETER_MENU = ReplyKeyboardMarkup([
 
 # Подменю: Генерация контента
 CONTENT_MENU = ReplyKeyboardMarkup([
-    ["Идеи Reels 🎬", "Заголовки 🔥"],
-    ["Посты/описания ✍️", "Контент-план на 14 дней 🗓️"],
-    ["Тексты для баннеров 📣"],
+    ["Создать изображение 🔒️"],
+    ["Создать Reels/Shorts 🔒️", "Создать Видео до 3 минут 🔒️"],
+    ["Создать презентацию 🔒️"],
     ["⬅️ В главное меню"]
 ], resize_keyboard=True)
 
 INLINE_CONTACT = InlineKeyboardMarkup([
-    [InlineKeyboardButton("Написать в Telegram менеджеру", url="https://t.me/maglena_a")],
-    [InlineKeyboardButton("Получить презентацию 360°", callback_data="get_presentation")]
+    [InlineKeyboardButton("Написать в Telegram менеджеру", url="https://t.me/maglena_a")]
 ])
 
 INLINE_START_DIAG = InlineKeyboardMarkup([
@@ -150,8 +150,7 @@ async def chatgpt_answer(prompt: str, system: str = None, temperature: float = T
     last_err = None
     for attempt in range(OPENAI_RETRIES):
         try:
-            resp = await asyncio.to_thread(
-                client.chat.completions.create,
+            resp = await client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": sys_msg},
@@ -292,7 +291,7 @@ def reset_state(user_id: int):
 
 
 BOLTALKA_HINT_TEXT = (
-    "💬 Болталка включена. Можешь задавать уточняющие вопросы в свободной форме.\n"
+    "Можешь задавать уточняющие вопросы в свободной форме.\n"
     "Чтобы выйти, нажми «⬅️ В главное меню»."
 )
 
@@ -781,15 +780,10 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages.extend(st.chat_history)
 
     # вызываем OpenAI
-    resp = await run_with_typing_indicator(
-        context.bot,
-        chat_id,
-        asyncio.to_thread(
-            client.chat.completions.create,
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=TEMPERATURE,
-        )
+    resp = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=TEMPERATURE,
     )
     answer = resp.choices[0].message.content.strip()
 
